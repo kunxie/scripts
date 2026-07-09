@@ -34,6 +34,46 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Return success if a cask may need administrator privileges to upgrade.
+brew_cask_needs_privileges() {
+  local cask="$1"
+  local cask_info
+
+  if ! command_exists ruby; then
+    return 0
+  fi
+
+  if ! cask_info="$(brew info --json=v2 --cask "${cask}")"; then
+    return 0
+  fi
+
+  ruby -rjson -e '
+    data = JSON.parse(STDIN.read)
+    privileged_path = %r{\A/(Library/(LaunchDaemons|PrivilegedHelperTools)|System/)}
+
+    needs_privileges = lambda do |value|
+      case value
+      when Hash
+        return true if value.key?("pkg") || value.key?("installer")
+        return true if value.key?("launchctl") || value.key?("kext")
+
+        value.any? do |key, nested|
+          key == "target" && nested.is_a?(String) && nested.match?(privileged_path) ||
+            needs_privileges.call(nested)
+        end
+      when Array
+        value.any? { |nested| needs_privileges.call(nested) }
+      when String
+        value.match?(privileged_path)
+      else
+        false
+      end
+    end
+
+    exit(data.fetch("casks", []).any? { |cask| needs_privileges.call(cask.fetch("artifacts", [])) } ? 0 : 1)
+  ' <<< "${cask_info}"
+}
+
 # Run a command, log it, and remember failures without stopping the script.
 # "$@" means "all arguments passed to this function, exactly as separate words".
 run() {
@@ -45,6 +85,35 @@ run() {
     log "Failed (${status}): $*"
     FAILURES=$((FAILURES + 1))
   fi
+}
+
+# Run a command with retries, then remember one failure if all attempts fail.
+run_with_retries() {
+  local attempts="$1"
+  local delay_seconds="$2"
+  shift 2
+
+  local attempt=1
+  local status=0
+
+  while [ "${attempt}" -le "${attempts}" ]; do
+    log "Running attempt ${attempt}/${attempts}: $*"
+    if "$@"; then
+      log "Completed: $*"
+      return
+    fi
+
+    status=$?
+    if [ "${attempt}" -lt "${attempts}" ]; then
+      log "Attempt ${attempt}/${attempts} failed (${status}); retrying in ${delay_seconds}s: $*"
+      sleep "${delay_seconds}"
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  log "Failed after ${attempts} attempts (${status}): $*"
+  FAILURES=$((FAILURES + 1))
 }
 
 # Return success when this script should use sudo for apt commands.
@@ -84,11 +153,23 @@ run_apt() {
   if sudo_prefix; then
     run sudo "${apt_env[@]}" apt-get update -y
     run sudo "${apt_env[@]}" apt-get upgrade -y "${apt_options[@]}"
+
+    # autoremove deletes packages that were installed as dependencies but are
+    # no longer needed.
     run sudo "${apt_env[@]}" apt-get autoremove -y
+
+    # clean removes downloaded package files from apt's local cache.
+    run sudo "${apt_env[@]}" apt-get clean
   else
     run "${apt_env[@]}" apt-get update -y
     run "${apt_env[@]}" apt-get upgrade -y "${apt_options[@]}"
+
+    # autoremove deletes packages that were installed as dependencies but are
+    # no longer needed.
     run "${apt_env[@]}" apt-get autoremove -y
+
+    # clean removes downloaded package files from apt's local cache.
+    run "${apt_env[@]}" apt-get clean
   fi
 }
 
@@ -111,8 +192,36 @@ run_brew() {
   # update refreshes Homebrew itself and formula metadata.
   run "${brew_env[@]}" brew update
 
-  # upgrade --greedy also upgrades casks that normally require extra prompting.
-  run "${brew_env[@]}" brew upgrade --greedy
+  # Formula upgrades do not require cask helper removal/install steps.
+  run "${brew_env[@]}" brew upgrade --formula
+
+  # Upgrade casks one at a time so privileged casks can be skipped.
+  local outdated_casks
+  local skipped_privileged_casks=()
+  outdated_casks="$("${brew_env[@]}" brew outdated --cask --greedy --quiet 2>/dev/null || true)"
+
+  if [ -z "${outdated_casks}" ]; then
+    log "No outdated Homebrew casks found."
+  else
+    local cask
+    while IFS= read -r cask; do
+      [ -n "${cask}" ] || continue
+
+      if brew_cask_needs_privileges "${cask}"; then
+        log "Skipping privileged Homebrew cask: ${cask}"
+        skipped_privileged_casks+=("${cask}")
+      else
+        run "${brew_env[@]}" brew upgrade --cask --greedy "${cask}"
+      fi
+    done <<< "${outdated_casks}"
+
+    if [ "${#skipped_privileged_casks[@]}" -gt 0 ]; then
+      log "Privileged Homebrew casks not updated:"
+      for cask in "${skipped_privileged_casks[@]}"; do
+        log "  - ${cask}"
+      done
+    fi
+  fi
 
   # cleanup removes old downloaded files and old package versions.
   run "${brew_env[@]}" brew cleanup
@@ -142,8 +251,11 @@ run_mise() {
     run mise self-update --yes
   fi
 
-  # --bump moves configured tools to the newest available versions.
-  run mise upgrade --yes --bump
+  # Keep each tool within the version range set in mise config.
+  run_with_retries 3 30 mise upgrade --yes
+
+  # prune removes old mise-managed tool versions that are no longer used.
+  run mise prune --yes
 }
 
 main() {
