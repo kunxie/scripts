@@ -16,7 +16,7 @@ tools managed by `mise`.
 If needed, make it executable first:
 
 ```sh
-chmod +x /Users/kunxie/scripts/host-updates.sh
+chmod +x "$HOME/scripts/host-updates.sh"
 ```
 
 ## Recommended Crontab
@@ -36,7 +36,7 @@ Add this entry:
 SHELL=/bin/zsh
 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-0 */3 * * * /Users/kunxie/scripts/host-updates.sh
+0 */3 * * * "$HOME/scripts/host-updates.sh"
 ```
 
 The schedule means: run at minute `0`, every 3 hours, every day.
