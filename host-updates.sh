@@ -6,6 +6,10 @@ set -u
 # If a command pipeline fails, treat the whole pipeline as failed.
 set -o pipefail
 
+# Cron starts with a small PATH. Include the common package-manager locations so
+# the script behaves the same from cron and an interactive shell.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 # Every run writes to a fresh log file under $HOME/logs.
 LOG_DIR="${HOME}/logs"
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
@@ -116,20 +120,25 @@ run_with_retries() {
   FAILURES=$((FAILURES + 1))
 }
 
-# Return success when this script should use sudo for apt commands.
-# If already running as root, sudo is not needed.
-sudo_prefix() {
+# Return success when this script can run apt commands without prompting.
+can_run_apt() {
   if [ "$(id -u)" -eq 0 ]; then
-    return 1
+    return 0
   fi
 
-  command_exists sudo
+  command_exists sudo && sudo -n true >/dev/null 2>&1
 }
 
 # Update Ubuntu/Debian packages through apt-get.
 run_apt() {
   if ! command_exists apt-get; then
     log "apt-get is not installed; skipping apt updates."
+    return
+  fi
+
+  if ! can_run_apt; then
+    log "apt updates require root or passwordless sudo; skipping apt updates."
+    FAILURES=$((FAILURES + 1))
     return
   fi
 
@@ -149,28 +158,20 @@ run_apt() {
     -o Dpkg::Options::=--force-confold
   )
 
-  # Use sudo when available and needed. Otherwise run apt-get directly.
-  if sudo_prefix; then
-    run sudo "${apt_env[@]}" apt-get update -y
-    run sudo "${apt_env[@]}" apt-get upgrade -y "${apt_options[@]}"
-
-    # autoremove deletes packages that were installed as dependencies but are
-    # no longer needed.
-    run sudo "${apt_env[@]}" apt-get autoremove -y
-
-    # clean removes downloaded package files from apt's local cache.
-    run sudo "${apt_env[@]}" apt-get clean
-  else
-    run "${apt_env[@]}" apt-get update -y
-    run "${apt_env[@]}" apt-get upgrade -y "${apt_options[@]}"
-
-    # autoremove deletes packages that were installed as dependencies but are
-    # no longer needed.
-    run "${apt_env[@]}" apt-get autoremove -y
-
-    # clean removes downloaded package files from apt's local cache.
-    run "${apt_env[@]}" apt-get clean
+  local apt_prefix=()
+  if [ "$(id -u)" -ne 0 ]; then
+    apt_prefix=(sudo -n)
   fi
+
+  run "${apt_prefix[@]}" "${apt_env[@]}" apt-get update
+  run "${apt_prefix[@]}" "${apt_env[@]}" apt-get upgrade -y "${apt_options[@]}"
+
+  # autoremove deletes packages that were installed as dependencies but are no
+  # longer needed.
+  run "${apt_prefix[@]}" "${apt_env[@]}" apt-get autoremove -y
+
+  # clean removes downloaded package files from apt's local cache.
+  run "${apt_prefix[@]}" "${apt_env[@]}" apt-get clean
 }
 
 # Update Homebrew packages on macOS.
@@ -259,7 +260,7 @@ run_mise() {
 }
 
 main() {
-  log "Starting daily updates. Log file: ${LOG_FILE}"
+  log "Starting host updates. Log file: ${LOG_FILE}"
 
   # Choose the update path based on the operating system name.
   case "$(uname -s)" in

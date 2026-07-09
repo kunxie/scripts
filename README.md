@@ -1,11 +1,15 @@
 # Host Update Script
 
-`host-updates.sh` runs routine host package updates and writes a timestamped log
-to `~/logs`.
+`host-updates.sh` runs routine host package updates and writes a timestamped
+log to `~/logs`.
 
-On macOS it updates Homebrew formulae, upgrades non-privileged Homebrew casks,
+On macOS, it updates Homebrew formulae, upgrades non-privileged Homebrew casks,
 skips casks that are likely to require an administrator password, and updates
 tools managed by `mise`.
+
+On Ubuntu-like Linux hosts, it updates apt packages and updates tools managed by
+`mise`. apt updates run only when the script is already root or `sudo` can run
+without a password prompt.
 
 ## Run Manually
 
@@ -33,9 +37,6 @@ crontab -e
 Add this entry:
 
 ```cron
-SHELL=/bin/zsh
-PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-
 0 */3 * * * "$HOME/scripts/host-updates.sh"
 ```
 
@@ -52,5 +53,7 @@ The script already logs to files like:
 - The script avoids privileged Homebrew casks, so normal cron runs should not
   stop on a macOS password prompt.
 - Skipped privileged casks are listed in the script log.
+- On Linux, apt updates are skipped and counted as a failure unless the script
+  runs as root or `sudo -n true` succeeds.
 - If a network download fails during `mise upgrade`, the script retries before
   reporting a failure.
